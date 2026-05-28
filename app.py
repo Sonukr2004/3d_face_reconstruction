@@ -22,6 +22,7 @@ from core.mesh_builder        import MeshBuilder
 from core.texture_mapper      import TextureMapper
 from core.mesh_exporter       import MeshExporter
 from core.face_auth           import FaceAuthSystem
+from core.custom_model        import CustomFaceClassifier
 from visualization.plotly_viewer import build_3d_figure, build_landmarks_figure
 from utils.image_utils        import pil_to_cv2, cv2_to_pil, resize_keep_aspect, auto_orient
 
@@ -273,10 +274,13 @@ def main():
     depth_scale, wireframe, auto_rotate = render_sidebar()
 
     # ── Top-level page tabs ────────────────────────────────────────────────────
-    page_3d, page_auth = st.tabs(["🌐 3D Reconstruction", "🔐 Face Authentication"])
+    page_3d, page_auth, page_train = st.tabs(["🌐 3D Reconstruction", "🔐 Face Authentication", "🧠 Model Training"])
 
     with page_auth:
         render_auth_page(face_detector, lm_extractor)
+
+    with page_train:
+        render_training_page()
 
     with page_3d:
         # ── input ─────────────────────────────────────────────────────────────────
@@ -451,6 +455,308 @@ background:rgba(108,99,255,0.06);border:1px dashed rgba(108,99,255,0.25);border-
                     )
 
 
+# ── Model Training Page ──────────────────────────────────────────────────────
+def render_training_page():
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    st.markdown("""
+<div style='background:linear-gradient(135deg,rgba(108,99,255,0.12),rgba(255,107,157,0.08));
+border:1px solid rgba(108,99,255,0.25);border-radius:16px;padding:1.5rem;margin-bottom:1.5rem'>
+<h3 style='color:#a0a8ff;margin:0 0 0.5rem'>🧠 Custom Face Recognition Model — Trained From Scratch</h3>
+<p style='color:rgba(180,180,220,0.75);font-size:0.88rem;margin:0'>
+This page trains a <b>Multi-Layer Perceptron (MLP)</b> entirely from scratch using pure NumPy —
+no pretrained weights, no external deep learning frameworks. The model learns directly on
+the 128-D face embeddings extracted from your registered users.
+</p>
+</div>""", unsafe_allow_html=True)
+
+    auth = FaceAuthSystem()
+    profiles = auth.list_profiles()
+
+    # ── Architecture Diagram ──────────────────────────────────────────────────
+    st.markdown('<div class="section-header">🏗️ Model Architecture</div>', unsafe_allow_html=True)
+
+    arch_layers = [
+        {"name": "Input Layer",   "neurons": 128, "activation": "Raw 128-D SFace Embeddings", "color": "#6c63ff"},
+        {"name": "PCA Layer",     "neurons": 32,  "activation": "Linear Projection (32-D)",   "color": "#00d4ff"},
+        {"name": "Hidden Layer 1","neurons": 64,  "activation": "ReLU + Dropout (20%)",       "color": "#ff6b9d"},
+        {"name": "Hidden Layer 2","neurons": 32,  "activation": "ReLU + Dropout (20%)",       "color": "#ff8e53"},
+        {"name": "Output Layer",  "neurons": "N", "activation": "Softmax (1 per user)",       "color": "#00e87a"},
+    ]
+    arch_cols = st.columns(len(arch_layers))
+    for col, layer in zip(arch_cols, arch_layers):
+        with col:
+            st.markdown(
+                f'<div class="stat-card" style="border-color:{layer["color"]}33">'
+                f'<div style="font-size:1.6rem;font-weight:700;color:{layer["color"]}">{layer["neurons"]}</div>'
+                f'<div style="font-weight:600;color:#c0c8ff;font-size:0.85rem;margin:0.3rem 0">{layer["name"]}</div>'
+                f'<div style="font-size:0.70rem;color:rgba(170,170,210,0.65)">{layer["activation"]}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("""
+<div style='text-align:center;color:rgba(150,150,200,0.5);font-size:0.78rem;margin:0.3rem 0 1.2rem'>
+⚡ Training: Mini-batch SGD · Momentum=0.9 · LR Decay (×0.97 per 10 epochs) · L2 Regularisation (λ=1e-4)
+</div>""", unsafe_allow_html=True)
+
+    # ── Check registered users ────────────────────────────────────────────────
+    if len(profiles) < 2:
+        st.warning("""
+⚠️ **Need at least 2 registered users to train!**
+Go to the **🔐 Face Authentication → Register User** tab and register at least 2 people, then come back here.
+        """)
+        return
+
+    # ── Training Config ───────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">⚙️ Training Configuration</div>', unsafe_allow_html=True)
+    cfg1, cfg2, cfg3, cfg4 = st.columns(4)
+    with cfg1:
+        n_epochs = st.slider("Epochs", 20, 150, 60, 5, key="train_epochs")
+    with cfg2:
+        aug_factor = st.slider("Data Augmentation ×", 5, 30, 15, 1, key="train_aug",
+                               help="Multiply training samples via Gaussian noise augmentation")
+    with cfg3:
+        pca_k = st.slider("PCA Components", 8, 32, 24, 2, key="train_pca")
+    with cfg4:
+        lr_val = st.select_slider("Learning Rate", [0.01, 0.02, 0.05, 0.1, 0.2], value=0.05, key="train_lr")
+
+    # ── Load embeddings from disk ─────────────────────────────────────────────
+    embeddings, labels = [], []
+    for p in profiles:
+        sig_path = p.get("sig_path", "")
+        if os.path.exists(sig_path):
+            emb = np.load(sig_path)
+            embeddings.append(emb.flatten()[:128])
+            labels.append(p["name"])
+
+    if len(set(labels)) < 2:
+        st.error("❌ Could not load embeddings for 2+ distinct users. Re-register users.")
+        return
+
+    n_users  = len(set(labels))
+    raw_embs = np.array(embeddings, dtype=np.float32)
+    raw_lbls = np.array(labels)
+
+    # ── Info row ─────────────────────────────────────────────────────────────
+    info1, info2, info3, info4 = st.columns(4)
+    for col, val, lbl in [
+        (info1, str(len(raw_embs)),                   "Raw Samples"),
+        (info2, str(len(raw_embs) * aug_factor),      "Augmented Samples"),
+        (info3, str(n_users),                         "Classes (Users)"),
+        (info4, str(pca_k),                           "PCA Dimensions"),
+    ]:
+        with col:
+            st.markdown(
+                f'<div class="stat-card">'
+                f'<div class="stat-value">{val}</div>'
+                f'<div class="stat-label">{lbl}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("")
+
+    # ── Train Button ──────────────────────────────────────────────────────────
+    if not st.button("🚀 Start Training Custom Model", use_container_width=True, key="btn_train"):
+        st.markdown("""
+<div style='text-align:center;padding:2rem;color:rgba(180,180,220,0.5);font-size:0.9rem'>
+👆 Click the button above to begin training your custom model from scratch.
+</div>""", unsafe_allow_html=True)
+        return
+
+    # ── Data Augmentation ─────────────────────────────────────────────────────
+    rng_aug = np.random.default_rng(7)
+    aug_embs, aug_lbls = list(raw_embs), list(raw_lbls)
+    for emb, lbl in zip(raw_embs, raw_lbls):
+        for _ in range(aug_factor - 1):
+            noise = rng_aug.normal(0, 0.012, emb.shape).astype(np.float32)
+            aug_embs.append(emb + noise)
+            aug_lbls.append(lbl)
+    aug_embs = np.array(aug_embs, dtype=np.float32)
+    aug_lbls = np.array(aug_lbls)
+
+    # Shuffle
+    perm = rng_aug.permutation(len(aug_embs))
+    aug_embs, aug_lbls = aug_embs[perm], aug_lbls[perm]
+
+    # ── PCA ───────────────────────────────────────────────────────────────────
+    clf = CustomFaceClassifier(pca_components=pca_k)
+    clf.mlp = None
+    X_pca, y = clf.prepare_data(list(aug_embs), list(aug_lbls))
+    mlp = clf.build_mlp(n_classes=n_users)
+    mlp.lr = lr_val
+
+    # ── PCA Variance chart ────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">📊 PCA Explained Variance</div>', unsafe_allow_html=True)
+    var = clf.pca.explained_variance_ratio_
+    cum_var = np.cumsum(var)
+    fig_pca = go.Figure()
+    fig_pca.add_bar(
+        x=list(range(1, len(var)+1)), y=var * 100,
+        name="Per Component",
+        marker_color="#6c63ff", opacity=0.7,
+    )
+    fig_pca.add_scatter(
+        x=list(range(1, len(cum_var)+1)), y=cum_var * 100,
+        name="Cumulative", mode="lines+markers",
+        line={"color": "#00d4ff", "width": 2},
+        marker={"size": 5},
+    )
+    fig_pca.add_hline(y=90, line_dash="dash", line_color="#ff6b9d",
+                      annotation_text="90% threshold", annotation_font_color="#ff6b9d")
+    fig_pca.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0.2)",
+        height=260,
+        margin={"t": 20, "b": 40, "l": 50, "r": 20},
+        legend={"orientation": "h", "y": 1.05},
+        xaxis_title="Principal Component",
+        yaxis_title="Variance Explained (%)",
+    )
+    st.plotly_chart(fig_pca, use_container_width=True)
+
+    # ── Live Training Charts ──────────────────────────────────────────────────
+    st.markdown('<div class="section-header">📈 Live Training Progress</div>', unsafe_allow_html=True)
+
+    prog_bar  = st.progress(0, text="Epoch 0 / " + str(n_epochs))
+    chart_ph  = st.empty()
+    stats_ph  = st.empty()
+
+    loss_hist, acc_hist, epochs_hist, lr_hist = [], [], [], []
+
+    UPDATE_EVERY = max(1, n_epochs // 40)   # refresh chart ~40 times
+
+    for metrics in mlp.fit_epoch_by_epoch(X_pca, y, n_epochs=n_epochs, batch_size=16):
+        ep    = metrics["epoch"]
+        loss_hist.append(metrics["loss"])
+        acc_hist.append(metrics["accuracy"] * 100)
+        epochs_hist.append(ep)
+        lr_hist.append(metrics["lr"])
+
+        prog_bar.progress(ep / n_epochs, text=f"Epoch {ep} / {n_epochs} — Loss: {metrics['loss']:.4f}  Acc: {metrics['accuracy']*100:.1f}%")
+
+        if ep % UPDATE_EVERY == 0 or ep == n_epochs:
+            fig_train = make_subplots(
+                rows=1, cols=2,
+                subplot_titles=("Cross-Entropy Loss", "Training Accuracy (%)"),
+            )
+            fig_train.add_scatter(
+                x=epochs_hist, y=loss_hist, mode="lines",
+                line={"color": "#ff6b9d", "width": 2},
+                name="Loss", row=1, col=1,
+            )
+            fig_train.add_scatter(
+                x=epochs_hist, y=acc_hist, mode="lines",
+                line={"color": "#00d4ff", "width": 2},
+                fill="tozeroy", fillcolor="rgba(0,212,255,0.08)",
+                name="Accuracy", row=1, col=2,
+            )
+            fig_train.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0.2)",
+                height=300,
+                margin={"t": 40, "b": 40, "l": 50, "r": 20},
+                showlegend=False,
+            )
+            fig_train.update_xaxes(title_text="Epoch")
+            chart_ph.plotly_chart(fig_train, use_container_width=True)
+
+    prog_bar.progress(1.0, text="✅ Training Complete!")
+
+    final_acc  = acc_hist[-1]
+    final_loss = loss_hist[-1]
+
+    # ── Final stats ───────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">🏆 Training Results</div>', unsafe_allow_html=True)
+    r1, r2, r3, r4 = st.columns(4)
+    for col, val, lbl in [
+        (r1, f"{final_acc:.1f}%",  "Final Accuracy"),
+        (r2, f"{final_loss:.4f}",  "Final Loss"),
+        (r3, f"{n_epochs}",         "Epochs Trained"),
+        (r4, f"{len(aug_embs)}",    "Training Samples"),
+    ]:
+        with col:
+            st.markdown(
+                f'<div class="stat-card">'
+                f'<div class="stat-value">{val}</div>'
+                f'<div class="stat-label">{lbl}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Weight Heatmap ────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">🔥 Learned Weight Heatmaps</div>', unsafe_allow_html=True)
+    winfo = mlp.get_weights_info()
+    wc1, wc2, wc3 = st.columns(3)
+    for wc, wkey, wtitle in [(wc1,"W1","W1: PCA→Hidden 1 (32×64)"),(wc2,"W2","W2: H1→H2 (64×32)"),(wc3,"W3",f"W3: H2→Output (32×{n_users})")]:
+        with wc:
+            wmat = winfo[wkey]
+            fig_w = go.Figure(go.Heatmap(
+                z=wmat[:32, :32] if wmat.shape[0] > 32 else wmat,
+                colorscale="RdBu", zmid=0,
+                showscale=False,
+            ))
+            fig_w.update_layout(
+                title={"text": wtitle, "font": {"size": 11, "color": "#a0a8ff"}},
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                height=200,
+                margin={"t": 30, "b": 5, "l": 5, "r": 5},
+            )
+            st.plotly_chart(fig_w, use_container_width=True)
+
+    # ── Confusion Matrix ──────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">🗂️ Confusion Matrix (Training Set)</div>', unsafe_allow_html=True)
+    last_metrics_preds = mlp.predict(X_pca)
+    label_list = sorted(set(labels))
+    label_map_inv = {i: lbl for i, lbl in enumerate(label_list)}
+    n_cls = len(label_list)
+    cm = np.zeros((n_cls, n_cls), dtype=int)
+    y_idx_arr = np.array([label_list.index(lbl) for lbl in aug_lbls])
+    for true, pred in zip(y_idx_arr, last_metrics_preds):
+        cm[true][pred] += 1
+    cm_norm = cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-9)
+
+    fig_cm = go.Figure(go.Heatmap(
+        z=cm_norm,
+        x=[f"Pred: {l}" for l in label_list],
+        y=[f"True: {l}" for l in label_list],
+        text=cm,
+        texttemplate="%{text}",
+        colorscale="Blues",
+        showscale=True,
+    ))
+    fig_cm.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0.2)",
+        height=max(280, n_cls * 80),
+        margin={"t": 20, "b": 60, "l": 100, "r": 20},
+    )
+    st.plotly_chart(fig_cm, use_container_width=True)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    st.success(
+        f"✅ Custom MLP trained successfully! "
+        f"{n_epochs} epochs · {len(aug_embs)} samples · "
+        f"Final accuracy **{final_acc:.1f}%** · Loss **{final_loss:.4f}**"
+    )
+    st.markdown("""
+<div style='background:rgba(0,212,255,0.06);border:1px solid rgba(0,212,255,0.2);
+border-radius:12px;padding:1rem 1.2rem;font-size:0.82rem;color:rgba(180,180,220,0.75);margin-top:0.5rem'>
+<b style='color:#00d4ff'>How this model was trained:</b><br>
+1. <b>Feature Extraction</b> — 128-D SFace embeddings from each enrolled face<br>
+2. <b>Data Augmentation</b> — Gaussian noise copies to simulate real-world variation<br>
+3. <b>PCA</b> — Dimensionality reduction from 128-D → 32-D (from scratch using eigen-decomposition)<br>
+4. <b>MLP Forward Pass</b> — ReLU activations, dropout regularisation, Softmax output<br>
+5. <b>Backpropagation</b> — Chain-rule gradient computation, fully implemented in NumPy<br>
+6. <b>Optimiser</b> — SGD with momentum (0.9), learning rate decay, L2 regularisation
+</div>""", unsafe_allow_html=True)
+
+
 # ── Face Authentication Page ───────────────────────────────────────────────────
 def render_auth_page(face_detector, lm_extractor):
     auth = FaceAuthSystem()
@@ -577,7 +883,7 @@ border:2px solid #00c864;border-radius:16px;padding:2rem;text-align:center;margi
 <div style='font-size:1.8rem;font-weight:700;color:#00e87a;margin:0.5rem 0'>ACCESS GRANTED</div>
 <div style='font-size:1.1rem;color:#80ffb0'>Welcome, <b>{res["name"]}</b></div>
 <div style='font-size:0.9rem;color:rgba(150,255,180,0.7);margin-top:0.5rem'>
-Match Score: <b>{sim_pct:.1f}%</b> &nbsp;|&nbsp; distance {res["distance"]:.2f} ≤ threshold {res["threshold"]:.0f}
+Match Score: <b>{sim_pct:.1f}%</b> (threshold: {res["threshold"]*100:.0f}%)
 </div>
 </div>""", unsafe_allow_html=True)
                                 else:
