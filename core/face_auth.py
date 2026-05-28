@@ -171,7 +171,12 @@ class FaceAuthSystem:
         results = []
         for meta in profiles:
             try:
-                stored_emb = np.load(meta["sig_path"])
+                sig_path = meta.get("sig_path")
+                # Fallback to local profile directory path if the absolute path doesn't exist (e.g. EC2 vs local)
+                if not sig_path or not os.path.exists(sig_path):
+                    sig_path = os.path.join(self.profiles_dir, f"{meta['id']}.npy")
+                
+                stored_emb = np.load(sig_path)
                 sim = compare_embeddings(probe_emb, stored_emb)
                 results.append({
                     "name":         meta["name"],
