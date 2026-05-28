@@ -9,6 +9,9 @@ Uses OpenCV's built-in deep learning face recognition:
 These models give >99% accuracy on LFW benchmark.
 SFace cosine threshold: 0.363 (OpenCV recommended for same-person match).
 
+Thread-safe: each thread gets its own YuNet/SFace instances via
+threading.local(), preventing C++ crashes under concurrent Streamlit sessions.
+
 Pipeline
 ────────
   1. YuNet detects face + 5 key landmarks inside the image
@@ -21,6 +24,7 @@ Pipeline
 
 import os
 import json
+import threading
 from typing import Optional
 import cv2
 import numpy as np
@@ -37,28 +41,32 @@ SFACE_MODEL  = os.path.join(MODELS_DIR, "face_recognition_sface_2021dec.onnx")
 MATCH_THRESHOLD = 0.40
 
 
-# ── Lazy-loaded singletons ────────────────────────────────────────────────────
+# ── Thread-local model storage ────────────────────────────────────────────────
 
-_yunet = None
-_sface = None
+_thread_local = threading.local()
 
 
 def _get_yunet(w: int, h: int):
-    """Get or create YuNet detector sized for the input image."""
-    global _yunet
-    _yunet = cv2.FaceDetectorYN.create(YUNET_MODEL, "", (w, h),
-                                        score_threshold=0.7,
-                                        nms_threshold=0.3,
-                                        top_k=10)
-    return _yunet
+    """Get or create a per-thread YuNet detector sized for the input image."""
+    yunet = getattr(_thread_local, "yunet", None)
+    if yunet is None:
+        yunet = cv2.FaceDetectorYN.create(YUNET_MODEL, "", (w, h),
+                                           score_threshold=0.7,
+                                           nms_threshold=0.3,
+                                           top_k=10)
+        _thread_local.yunet = yunet
+    else:
+        yunet.setInputSize((w, h))
+    return yunet
 
 
 def _get_sface():
-    """Get or create SFace recogniser."""
-    global _sface
-    if _sface is None:
-        _sface = cv2.FaceRecognizerSF.create(SFACE_MODEL, "")
-    return _sface
+    """Get or create a per-thread SFace recogniser."""
+    sface = getattr(_thread_local, "sface", None)
+    if sface is None:
+        sface = cv2.FaceRecognizerSF.create(SFACE_MODEL, "")
+        _thread_local.sface = sface
+    return sface
 
 
 # ── Core: extract 128-D embedding ─────────────────────────────────────────────
