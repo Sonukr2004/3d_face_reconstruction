@@ -929,17 +929,32 @@ border:1px solid rgba(100,100,255,0.15)'>
 No users registered yet. Go to <b>Register User</b> tab to add the first user.
 </div>""", unsafe_allow_html=True)
         else:
-            st.success(f"✅ {len(profiles)} user(s) registered")
+            stale_profiles = [p for p in profiles if p.get("stale")]
+            good_profiles  = [p for p in profiles if not p.get("stale")]
+            if stale_profiles:
+                st.warning(
+                    f"⚠️ **{len(stale_profiles)} profile(s) below use an old format** and cannot be "
+                    "verified. Delete them and re-register to fix the 'Could not load any profiles' error."
+                )
+            if good_profiles:
+                st.success(f"✅ {len(good_profiles)} compatible user(s) registered")
+
             for p in profiles:
                 col_info, col_del = st.columns([4, 1])
                 with col_info:
-                    reg_time = p.get("registered_at","")[:16].replace("T"," ")
+                    reg_time  = p.get("registered_at", "")[:16].replace("T", " ")
+                    stale_tag = (
+                        "<span style='color:#ff6b6b;font-size:0.72rem;margin-left:0.6rem;"
+                        "background:rgba(255,100,100,0.15);padding:2px 7px;border-radius:4px;"
+                        "border:1px solid rgba(255,100,100,0.3)'>⚠️ STALE — delete &amp; re-register</span>"
+                        if p.get("stale") else ""
+                    )
                     st.markdown(f"""
 <div class='stat-card' style='text-align:left;padding:0.8rem 1rem;margin:0.3rem 0'>
 <span style='font-size:1.2rem'>👤</span>
 <span style='font-weight:600;color:#c0c8ff;margin-left:0.5rem'>{p["name"]}</span>
 <span style='color:rgba(150,150,200,0.5);font-size:0.75rem;margin-left:1rem'>
-Registered: {reg_time}</span>
+Registered: {reg_time}</span>{stale_tag}
 </div>""", unsafe_allow_html=True)
                 with col_del:
                     if st.button("🗑️", key=f"del_{p['id']}",

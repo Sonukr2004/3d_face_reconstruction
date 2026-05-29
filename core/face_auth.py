@@ -177,25 +177,43 @@ class FaceAuthSystem:
                     "error": "DNN could not detect a face. Use a clear frontal photo."}
 
         results = []
+        stale_count = 0
         for meta in profiles:
             try:
                 sig_path = meta.get("sig_path")
-                # Fallback to local profile directory path if the absolute path doesn't exist (e.g. EC2 vs local)
+                # Fallback: resolve relative to profiles dir if stored absolute path is stale
                 if not sig_path or not os.path.exists(sig_path):
                     sig_path = os.path.join(self.profiles_dir, f"{meta['id']}.npy")
-                
-                stored_emb = np.load(sig_path)
+
+                stored_emb = np.load(sig_path).flatten()
+
+                # SFace embeddings are always 128-D float32.
+                # Old profiles (LBP histogram) are much larger — skip them.
+                if stored_emb.shape != (128,):
+                    stale_count += 1
+                    continue
+
+                stored_emb = stored_emb.astype(np.float32)
                 sim = compare_embeddings(probe_emb, stored_emb)
                 results.append({
-                    "name":         meta["name"],
-                    "profile_id":   meta["id"],
-                    "similarity":   sim,
+                    "name":          meta["name"],
+                    "profile_id":    meta["id"],
+                    "similarity":    sim,
                     "registered_at": meta.get("registered_at", ""),
                 })
             except Exception:
                 continue
 
         if not results:
+            if stale_count > 0:
+                return {
+                    "success": False,
+                    "error": (
+                        f"⚠️ {stale_count} registered profile(s) used the old format and are "
+                        "incompatible with the current system. "
+                        "Please delete them in **Manage Users** and re-register."
+                    ),
+                }
             return {"success": False, "error": "Could not load any profiles."}
 
         results.sort(key=lambda r: r["similarity"], reverse=True)
@@ -213,7 +231,19 @@ class FaceAuthSystem:
             if fname.endswith(".json"):
                 try:
                     with open(os.path.join(self.profiles_dir, fname)) as f:
-                        profiles.append(json.load(f))
+                        meta = json.load(f)
+
+                    # Flag profiles whose stored embedding is not 128-D SFace format
+                    sig_path = meta.get("sig_path", "")
+                    if not sig_path or not os.path.exists(sig_path):
+                        sig_path = os.path.join(self.profiles_dir, f"{meta['id']}.npy")
+                    try:
+                        emb = np.load(sig_path).flatten()
+                        meta["stale"] = emb.shape != (128,)
+                    except Exception:
+                        meta["stale"] = True
+
+                    profiles.append(meta)
                 except Exception:
                     pass
         profiles.sort(key=lambda p: p.get("registered_at", ""), reverse=True)
